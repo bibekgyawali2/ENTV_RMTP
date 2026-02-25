@@ -70,9 +70,37 @@ class _SetupPageState extends State<SetupPage> {
     setState(() => _isLoading = false);
     if (!mounted) return;
 
-    Navigator.of(
-      context,
-    ).push(MaterialPageRoute(builder: (_) => CameraPage(streamUrl: streamUrl)));
+    Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => CameraPage(streamUrl: streamUrl, autoStart: true),
+      ),
+    );
+  }
+
+  void _goToCameraOnly() async {
+    if (_rtmpUrlController.text.isEmpty || _rtmpKeyController.text.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Please enter an RTMP URL and Stream Key'),
+        ),
+      );
+      return;
+    }
+
+    final streamUrl =
+        '${_rtmpUrlController.text.trimRight().replaceAll(RegExp(r'/+$'), '')}'
+        '/${_rtmpKeyController.text.trim()}';
+
+    setState(() => _isLoading = true);
+    await _saveSettings();
+    setState(() => _isLoading = false);
+    if (!mounted) return;
+
+    Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => CameraPage(streamUrl: streamUrl, autoStart: false),
+      ),
+    );
   }
 
   // ── Build ────────────────────────────────────────────────────────────────────
@@ -98,6 +126,21 @@ class _SetupPageState extends State<SetupPage> {
               keyController: _rtmpKeyController,
             ),
             const SizedBox(height: 32),
+            ElevatedButton(
+              onPressed: _isLoading ? null : _goToCameraOnly,
+              style: ElevatedButton.styleFrom(
+                padding: const EdgeInsets.symmetric(vertical: 16),
+                backgroundColor: Colors.blue.shade700,
+              ),
+              child: _isLoading
+                  ? const SizedBox(
+                      height: 20,
+                      width: 20,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : const Text('Connect Only', style: TextStyle(fontSize: 18)),
+            ),
+            const SizedBox(height: 16),
             ElevatedButton(
               onPressed: _isLoading ? null : _goToCamera,
               style: ElevatedButton.styleFrom(

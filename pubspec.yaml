@@ -36,6 +36,7 @@ dependencies:
   cupertino_icons: ^1.0.8
   rtmp_broadcaster: ^2.3.4
   shared_preferences: ^2.5.4
+  wakelock_plus: ^1.2.8
 
 dev_dependencies:
   flutter_test:
