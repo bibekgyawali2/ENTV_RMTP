@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:rtmp_broadcaster/camera.dart';
@@ -7,24 +8,36 @@ import 'package:permission_handler/permission_handler.dart';
 import 'package:tv_app/utils/audio_manager.dart';
 import 'package:tv_app/widgets/volume_indicator.dart';
 
-/// Represents the streaming connection state shown in the UI.
+/// Overall lifecycle state of the camera page.
+/// The page steps through these before showing the camera UI.
+enum _PageState {
+  checkingConnection, // Step 1 – TCP reachability test against RTMP host:port
+  connectionFailed, // TCP check failed – show error + retry
+  requestingPermissions,
+  permissionDenied,
+  initializingCamera, // Camera hardware init (also reused on lifecycle resume)
+  cameraError,
+  cameraReady, // Camera live – streaming controls are visible
+}
+
+/// Streaming-specific overlay status (only relevant in [_PageState.cameraReady]).
 enum _StreamStatus { idle, connecting, connected, retrying, error, stopped }
 
 class CameraPage extends StatefulWidget {
-  /// The full stream URL.
+  /// The full RTMP stream URL (e.g. rtmp://192.168.1.1:1935/live/mystream).
   final String streamUrl;
 
-  /// Whether to automatically start streaming when camera is ready.
+  /// When true the stream starts automatically once the camera is ready.
   final bool autoStart;
 
-  /// Whether to test connection only (no streaming).
-  final bool testConnection;
+  /// Target video bitrate in bits-per-second. Defaults to 1.2 Mbps.
+  final int bitrate;
 
   const CameraPage({
     super.key,
     required this.streamUrl,
     this.autoStart = false,
-    this.testConnection = false,
+    this.bitrate = 1200 * 1024,
   });
 
   @override
@@ -32,159 +45,203 @@ class CameraPage extends StatefulWidget {
 }
 
 class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
+  // ── Page state ───────────────────────────────────────────────────────────────
+  _PageState _pageState = _PageState.checkingConnection;
+  String? _pageError;
+
+  // ── Camera ───────────────────────────────────────────────────────────────────
   CameraController? _controller;
   List<CameraDescription> _cameras = [];
-  bool _isStreaming = false;
-  bool _isInitializing = true;
-  bool _isStreamingPaused = false;
-  bool _isMuted = false;
-  bool _isDisposing = false;
   bool _isSwitchingCamera = false;
 
+  /// Set to true inside [dispose] to prevent any async callback from touching
+  /// the widget tree or controller after teardown.
+  bool _isDisposed = false;
+
+  // ── Streaming ────────────────────────────────────────────────────────────────
+  bool _isStreaming = false;
+  bool _isStreamingPaused = false;
+  bool _isMuted = false;
   _StreamStatus _streamStatus = _StreamStatus.idle;
   String? _streamError;
   Timer? _connectionTimer;
-  bool _isTestingConnection = false;
-  String? _connectionTestResult;
+
+  // ────────────────────────────────────────────────────────────────────────────
+  // Lifecycle
+  // ────────────────────────────────────────────────────────────────────────────
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
-    WakelockPlus.enable(); // Keep screen on by default in camera page
-    _requestPermissionsAndInitCamera();
-    _checkInitialMuteState();
-  }
-
-  /// Request camera and microphone permissions before initializing camera
-  Future<void> _requestPermissionsAndInitCamera() async {
-    // Request camera and microphone permissions
-    final cameraStatus = await Permission.camera.request();
-    final microphoneStatus = await Permission.microphone.request();
-
-    if (!mounted) return;
-
-    if (cameraStatus.isGranted && microphoneStatus.isGranted) {
-      // Permissions granted, proceed with camera initialization
-      await _initCamera();
-    } else if (cameraStatus.isDenied || microphoneStatus.isDenied) {
-      // Permissions denied
-      setState(() {
-        _isInitializing = false;
-        _streamError = 'Camera and microphone permissions are required';
-      });
-      _showPermissionDialog();
-    } else if (cameraStatus.isPermanentlyDenied ||
-        microphoneStatus.isPermanentlyDenied) {
-      // Permissions permanently denied
-      setState(() {
-        _isInitializing = false;
-        _streamError = 'Please enable permissions in settings';
-      });
-      _showPermissionDialog(permanentlyDenied: true);
-    }
-  }
-
-  /// Show dialog to inform user about permissions
-  void _showPermissionDialog({bool permanentlyDenied = false}) {
-    if (!mounted) return;
-    showDialog(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('Permissions Required'),
-        content: Text(
-          permanentlyDenied
-              ? 'Camera and microphone permissions are required for streaming. Please enable them in app settings.'
-              : 'This app needs camera and microphone access to stream video.',
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text('Cancel'),
-          ),
-          if (permanentlyDenied)
-            TextButton(
-              onPressed: () {
-                openAppSettings();
-                Navigator.pop(context);
-              },
-              child: const Text('Open Settings'),
-            )
-          else
-            TextButton(
-              onPressed: () {
-                Navigator.pop(context);
-                _requestPermissionsAndInitCamera();
-              },
-              child: const Text('Retry'),
-            ),
-        ],
-      ),
-    );
-  }
-
-  Future<void> _checkInitialMuteState() async {
-    final isMuted = await AudioManager.isMicrophoneMute();
-    if (mounted) {
-      setState(() {
-        _isMuted = isMuted;
-      });
-    }
+    WakelockPlus.enable();
+    _checkConnection();
   }
 
   @override
   Future<void> didChangeAppLifecycleState(AppLifecycleState state) async {
+    if (_isDisposed) return;
+
     if (state == AppLifecycleState.paused ||
         state == AppLifecycleState.inactive) {
-      // App going to background, pausing stream and cleaning preview
+      // Pause the stream before releasing hardware.
       if (_isStreaming && !_isStreamingPaused) {
-        debugPrint('App paused: pausing stream');
+        debugPrint('Lifecycle: pausing stream');
         await _pauseStreaming();
       }
-
-      // We must dispose the camera to release hardware resources, otherwise we black out
+      // Release camera hardware to avoid black-screen on Android.
       if (_controller != null) {
-        _isDisposing = true;
+        _controller!.removeListener(_onControllerUpdate);
         await _controller!.dispose();
         _controller = null;
-        _isDisposing = false;
-      }
-      if (mounted) {
-        setState(() {
-          _isInitializing = true;
-        });
+        if (mounted) setState(() => _pageState = _PageState.initializingCamera);
       }
     } else if (state == AppLifecycleState.resumed) {
-      // App coming to foreground, reiniting camera
-      // Only reinit if we don't have a valid controller and not already initializing
-      if (_controller == null && !_isDisposing) {
+      // Re-initialise only if we previously tore down the controller.
+      if (_controller == null &&
+          _pageState == _PageState.initializingCamera &&
+          !_isDisposed) {
         await _initCamera();
-
         if (_isStreaming && _isStreamingPaused) {
-          debugPrint('App resumed: resuming stream');
+          debugPrint('Lifecycle: resuming stream');
           await _resumeStreaming();
         }
       }
     }
   }
 
-  Future<void> _initCamera() async {
-    // Prevent multiple simultaneous initializations
-    if (_isDisposing ||
-        (_controller != null && _controller!.value.isInitialized!)) {
-      debugPrint(
-        'Skipping camera init: disposing=$_isDisposing, controller exists=${_controller != null}',
+  @override
+  void dispose() {
+    debugPrint('CameraPage: dispose');
+    _isDisposed = true;
+    WidgetsBinding.instance.removeObserver(this);
+    _connectionTimer?.cancel();
+    _connectionTimer = null;
+
+    final ctrl = _controller;
+    _controller = null;
+    if (ctrl != null) {
+      ctrl.removeListener(_onControllerUpdate);
+      // Only stop the stream if one is actually running to avoid
+      // CameraException("stopVideoStreaming was called when no video is streaming").
+      final isStreaming = ctrl.value.isStreamingVideoRtmp ?? false;
+      if (isStreaming) {
+        ctrl
+            .stopVideoStreaming()
+            .catchError((_) {})
+            .whenComplete(() => ctrl.dispose().catchError((_) {}));
+      } else {
+        ctrl.dispose().catchError((_) {});
+      }
+    }
+
+    WakelockPlus.disable();
+    super.dispose();
+  }
+
+  // ────────────────────────────────────────────────────────────────────────────
+  // Step 1 – TCP connection check (no camera required)
+  // ────────────────────────────────────────────────────────────────────────────
+
+  Future<void> _checkConnection() async {
+    if (_isDisposed || !mounted) return;
+    setState(() {
+      _pageState = _PageState.checkingConnection;
+      _pageError = null;
+    });
+
+    try {
+      // Replace rtmp:// with http:// so Uri can parse host/port correctly.
+      final uri = Uri.parse(
+        widget.streamUrl.replaceFirst('rtmp://', 'http://'),
       );
+      final host = uri.host;
+      final port = uri.hasPort ? uri.port : 1935;
+
+      if (host.isEmpty) {
+        throw const SocketException('Invalid RTMP URL – no host found');
+      }
+
+      debugPrint('TCP check → $host:$port');
+      final socket = await Socket.connect(
+        host,
+        port,
+        timeout: const Duration(seconds: 10),
+      );
+      socket.destroy();
+      debugPrint('TCP check passed');
+
+      if (_isDisposed || !mounted) return;
+      await _requestPermissions();
+    } on SocketException catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _pageState = _PageState.connectionFailed;
+        _pageError = 'Cannot reach RTMP server:\n${e.message}';
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _pageState = _PageState.connectionFailed;
+        _pageError = 'Connection error:\n$e';
+      });
+    }
+  }
+
+  // ────────────────────────────────────────────────────────────────────────────
+  // Step 2 – Permission request
+  // ────────────────────────────────────────────────────────────────────────────
+
+  Future<void> _requestPermissions() async {
+    if (_isDisposed || !mounted) return;
+    setState(() {
+      _pageState = _PageState.requestingPermissions;
+      _pageError = null;
+    });
+
+    final cameraStatus = await Permission.camera.request();
+    final micStatus = await Permission.microphone.request();
+
+    if (_isDisposed || !mounted) return;
+
+    if (cameraStatus.isGranted && micStatus.isGranted) {
+      await _initCamera();
+    } else if (cameraStatus.isPermanentlyDenied ||
+        micStatus.isPermanentlyDenied) {
+      setState(() {
+        _pageState = _PageState.permissionDenied;
+        _pageError =
+            'Camera/microphone permissions are permanently denied.\nPlease enable them in app settings.';
+      });
+    } else {
+      setState(() {
+        _pageState = _PageState.permissionDenied;
+        _pageError = 'Camera and microphone permissions are required.';
+      });
+    }
+  }
+
+  // ────────────────────────────────────────────────────────────────────────────
+  // Step 3 – Camera initialisation
+  // ────────────────────────────────────────────────────────────────────────────
+
+  Future<void> _initCamera() async {
+    if (_isDisposed || !mounted) return;
+    // Guard against re-entry (e.g. lifecycle resume while already initialising).
+    if (_controller != null && _controller!.value.isInitialized == true) {
+      debugPrint('_initCamera: controller already ready, skipping');
       return;
     }
 
+    setState(() {
+      _pageState = _PageState.initializingCamera;
+      _pageError = null;
+    });
+
     try {
       _cameras = await availableCameras();
-      if (!mounted || _isDisposing) return;
-
-      if (_cameras.isEmpty) {
-        throw Exception('No cameras found on this device');
-      }
+      if (_isDisposed || !mounted) return;
+      if (_cameras.isEmpty) throw Exception('No cameras found on this device');
 
       final controller = CameraController(
         _cameras.first,
@@ -196,78 +253,63 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
 
       await controller.initialize();
 
-      // Check if we were disposed during initialization
-      if (!mounted || _isDisposing) {
-        debugPrint('Camera init cancelled, disposing created controller');
+      // Check if the widget was disposed or page closed during the async gap.
+      if (_isDisposed || !mounted) {
         await controller.dispose();
         return;
       }
 
-      if (!controller.value.isInitialized!) {
-        throw Exception('Camera failed to initialize');
+      if (controller.value.isInitialized != true) {
+        await controller.dispose();
+        throw Exception('Camera failed to initialise');
       }
 
-      // Only now assign the controller after successful initialization
       _controller = controller;
       _controller!.addListener(_onControllerUpdate);
 
-      // Test connection if requested
-      if (widget.testConnection && mounted && !_isStreaming) {
-        Future.delayed(const Duration(milliseconds: 500), () {
-          if (mounted) {
-            _testConnection();
-          }
-        });
-      }
-      // Auto-start streaming if requested
-      else if (widget.autoStart && mounted) {
-        Future.delayed(const Duration(milliseconds: 500), () {
-          if (mounted && !_isStreaming) {
-            _toggleStreaming();
-          }
-        });
+      setState(() => _pageState = _PageState.cameraReady);
+      _syncMuteState();
+
+      // Auto-start now that the server was already verified reachable.
+      if (widget.autoStart && !_isDisposed && mounted) {
+        await Future.delayed(const Duration(milliseconds: 300));
+        if (mounted && !_isDisposed) _toggleStreaming();
       }
     } catch (e) {
-      debugPrint("Camera initialization error: $e");
+      debugPrint('Camera init error: $e');
       if (mounted) {
         setState(() {
-          _streamError = 'Failed to initialize camera: ${e.toString()}';
+          _pageState = _PageState.cameraError;
+          _pageError = 'Failed to initialise camera:\n$e';
         });
-        _showErrorBanner('Camera error: ${e.toString()}');
-      }
-    } finally {
-      if (mounted) {
-        setState(() => _isInitializing = false);
       }
     }
   }
 
-  /// Listens to every CameraValue change and reacts to streaming lifecycle events.
+  Future<void> _syncMuteState() async {
+    final isMuted = await AudioManager.isMicrophoneMute();
+    if (mounted && !_isDisposed) setState(() => _isMuted = isMuted);
+  }
+
+  // ────────────────────────────────────────────────────────────────────────────
+  // Controller update listener
+  // ────────────────────────────────────────────────────────────────────────────
+
   void _onControllerUpdate() {
-    if (_controller == null || !mounted || _isDisposing || _isSwitchingCamera)
-      return;
+    if (_isDisposed || !mounted || _isSwitchingCamera) return;
+    if (_controller == null || _controller!.value.isInitialized != true) return;
 
-    // Check if controller is still valid
-    if (!_controller!.value.isInitialized!) {
-      debugPrint('Controller not initialized in update');
-      return;
-    }
-
-    // Check actual streaming state from controller
-    final bool isActuallyStreaming =
+    // Keep _isStreaming flag in sync with the native layer.
+    final bool actuallyStreaming =
         _controller!.value.isStreamingVideoRtmp ?? false;
-
-    // Sync our state with actual streaming state
-    if (isActuallyStreaming && !_isStreaming) {
-      debugPrint("Detected active streaming via controller state");
+    if (actuallyStreaming && !_isStreaming) {
       setState(() {
         _isStreaming = true;
         _streamStatus = _StreamStatus.connected;
       });
-    } else if (!isActuallyStreaming &&
+    } else if (!actuallyStreaming &&
         _isStreaming &&
         _streamStatus != _StreamStatus.connecting) {
-      debugPrint("Detected streaming stopped via controller state");
       setState(() {
         _isStreaming = false;
         _isStreamingPaused = false;
@@ -279,11 +321,10 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
 
     final String? eventType = event['eventType'] as String?;
     final String? errorDescription = event['errorDescription'] as String?;
-    const String proto = 'RTMP';
 
     switch (eventType) {
       case 'rtmp_connected':
-        debugPrint("Step 2: RTMP 'connect' and 'createStream' successful!");
+        debugPrint('RTMP connected');
         _connectionTimer?.cancel();
         _connectionTimer = null;
         setState(() {
@@ -293,10 +334,8 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
         });
 
       case 'rtmp_retry':
-        // Server rejected / dropped the connection; the plugin will retry.
-        // Keep the timer running – if it fires the user gets a clear timeout msg.
         final msg = errorDescription ?? 'Unknown server error';
-        debugPrint('$proto retry: $msg');
+        debugPrint('RTMP retry: $msg');
         setState(() {
           _streamStatus = _StreamStatus.retrying;
           _streamError = msg;
@@ -304,12 +343,10 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
         _showErrorBanner('Connection lost – retrying: $msg');
 
       case 'rtmp_stopped':
-        debugPrint("Connection closed.");
         _connectionTimer?.cancel();
         _connectionTimer = null;
-        // Stream ended (either manually or because all retries were exhausted).
         final msg = errorDescription ?? 'Stream stopped by server';
-        debugPrint('$proto stopped: $msg');
+        debugPrint('RTMP stopped: $msg');
         if (_isStreaming) {
           setState(() {
             _isStreaming = false;
@@ -325,17 +362,16 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
         }
 
       case 'error':
-        debugPrint("Handshake failed. Check Server URL/Network.");
         _connectionTimer?.cancel();
         _connectionTimer = null;
         final msg = errorDescription ?? 'Unknown error';
-        debugPrint('$proto error: $msg');
+        debugPrint('RTMP error: $msg');
         setState(() {
           _isStreaming = false;
           _streamStatus = _StreamStatus.error;
           _streamError = msg;
         });
-        _showErrorBanner('$proto error: $msg');
+        _showErrorBanner('RTMP error: $msg');
 
       case 'camera_closing':
         _connectionTimer?.cancel();
@@ -349,174 +385,32 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
     }
   }
 
-  /// Starts a watchdog timer after calling [startVideoStreaming].
+  // ────────────────────────────────────────────────────────────────────────────
+  // Streaming control
+  // ────────────────────────────────────────────────────────────────────────────
+
   void _startConnectionTimer() {
     _connectionTimer?.cancel();
-    // Use 60 seconds for test mode, 160 for normal streaming
-    final timeout = _isTestingConnection
-        ? const Duration(seconds: 60)
-        : const Duration(seconds: 160);
-    const String proto = 'RTMP';
-    _connectionTimer = Timer(timeout, () {
-      if (!mounted) return;
-      // Only fire if we are still waiting (not yet connected).
-      if ((_streamStatus == _StreamStatus.connecting ||
-              _streamStatus == _StreamStatus.retrying) &&
-          !_isTestingConnection) {
-        debugPrint('$proto connection timed out after ${timeout.inSeconds}s');
+    _connectionTimer = Timer(const Duration(seconds: 30), () {
+      if (!mounted || _isDisposed) return;
+      if (_streamStatus == _StreamStatus.connecting ||
+          _streamStatus == _StreamStatus.retrying) {
+        debugPrint('RTMP: connection timed out after 30 s');
         setState(() {
           _isStreaming = false;
           _streamStatus = _StreamStatus.error;
-          _streamError = 'Connection timed out after ${timeout.inSeconds}s';
+          _streamError = 'Connection timed out after 30 s';
         });
         _showErrorBanner(
-          '$proto: No response from server after ${timeout.inSeconds}s. '
-          'Check the URL/host and that the server is running.',
+          'RTMP: No response from server after 30 s. Check URL and server.',
         );
-        // Best-effort stop so the native side also cleans up.
         _controller?.stopVideoStreaming().catchError((_) {});
       }
     });
   }
 
-  void _showErrorBanner(String message) {
-    if (!mounted) return;
-    ScaffoldMessenger.of(context).clearSnackBars();
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text(message),
-        backgroundColor: Colors.red.shade700,
-        behavior: SnackBarBehavior.floating,
-        duration: const Duration(seconds: 5),
-      ),
-    );
-  }
-
-  Future<void> _testConnection() async {
-    if (_controller == null || _isTestingConnection || _isDisposing) return;
-    if (!_controller!.value.isInitialized!) return;
-
-    setState(() {
-      _isTestingConnection = true;
-      _connectionTestResult = 'Testing connection...';
-      _streamStatus = _StreamStatus.connecting;
-    });
-
-    debugPrint('Starting connection test...');
-
-    // Start connection timer (60 seconds)
-    _connectionTimer = Timer(const Duration(seconds: 60), () {
-      if (!mounted || !_isTestingConnection) return;
-      debugPrint('Connection test timed out after 60s');
-
-      _controller?.stopVideoStreaming().catchError((_) {});
-
-      setState(() {
-        _isTestingConnection = false;
-        _streamStatus = _StreamStatus.error;
-        _connectionTestResult =
-            'Connection test failed: Timeout after 60 seconds';
-        _streamError = 'Connection timeout';
-      });
-    });
-
-    try {
-      // Attempt to start streaming to test connection
-      await _controller!.startVideoStreaming(
-        widget.streamUrl,
-        bitrate: 1200 * 1024,
-      );
-
-      // Wait a bit to see if connection succeeds
-      await Future.delayed(const Duration(milliseconds: 2000));
-
-      // Check if actually connected
-      if (_controller!.value.isStreamingVideoRtmp ?? false) {
-        _connectionTimer?.cancel();
-        _connectionTimer = null;
-
-        // Stop streaming immediately after successful test
-        await _controller!.stopVideoStreaming();
-
-        setState(() {
-          _isTestingConnection = false;
-          _streamStatus = _StreamStatus.idle;
-          _connectionTestResult = 'Connection successful! ✓';
-          _streamError = null;
-        });
-        debugPrint('Connection test successful');
-      }
-    } catch (e) {
-      _connectionTimer?.cancel();
-      _connectionTimer = null;
-      debugPrint('Connection test error: $e');
-
-      final msg = e is CameraException
-          ? (e.description ?? e.code)
-          : e.toString();
-      setState(() {
-        _isTestingConnection = false;
-        _streamStatus = _StreamStatus.error;
-        _connectionTestResult = 'Connection failed: $msg';
-        _streamError = msg;
-      });
-    }
-  }
-
-  Future<void> _pauseStreaming() async {
-    if (_controller == null ||
-        !_isStreaming ||
-        _isStreamingPaused ||
-        _isDisposing)
-      return;
-
-    try {
-      if (!_controller!.value.isInitialized!) return;
-      await _controller!.pauseVideoStreaming();
-      if (mounted) {
-        setState(() {
-          _isStreamingPaused = true;
-        });
-      }
-      debugPrint('Streaming paused');
-    } catch (e) {
-      debugPrint('Pause streaming error: $e');
-      _showErrorBanner('Failed to pause stream');
-    }
-  }
-
-  Future<void> _resumeStreaming() async {
-    if (_controller == null ||
-        !_isStreaming ||
-        !_isStreamingPaused ||
-        _isDisposing)
-      return;
-
-    try {
-      if (!_controller!.value.isInitialized!) return;
-      await _controller!.resumeVideoStreaming();
-      if (mounted) {
-        setState(() {
-          _isStreamingPaused = false;
-        });
-      }
-      debugPrint('Streaming resumed');
-    } catch (e) {
-      debugPrint('Resume streaming error: $e');
-      _showErrorBanner('Failed to resume stream');
-    }
-  }
-
-  Future<void> _togglePauseResume() async {
-    if (_isStreamingPaused) {
-      await _resumeStreaming();
-    } else {
-      await _pauseStreaming();
-    }
-  }
-
   Future<void> _toggleStreaming() async {
-    if (_controller == null || !_controller!.value.isInitialized!) return;
+    if (_controller == null || _controller!.value.isInitialized != true) return;
 
     if (_isStreaming) {
       try {
@@ -532,7 +426,7 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
       });
       WakelockPlus.disable();
     } else {
-      debugPrint("Step 1: RTMP Handshake initiated...");
+      debugPrint('RTMP: initiating handshake');
       setState(() {
         _streamStatus = _StreamStatus.connecting;
         _streamError = null;
@@ -540,18 +434,17 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
       try {
         await _controller!.startVideoStreaming(
           widget.streamUrl,
-          bitrate: 1200 * 1024,
+          bitrate: widget.bitrate,
         );
         // _isStreaming flips to true via the 'rtmp_connected' event.
-        // Start a watchdog in case the server never replies.
         _startConnectionTimer();
       } catch (e) {
         _connectionTimer?.cancel();
         _connectionTimer = null;
-        debugPrint('Streaming Error: $e');
         final msg = e is CameraException
             ? (e.description ?? e.code)
             : e.toString();
+        debugPrint('RTMP start error: $msg');
         setState(() {
           _streamStatus = _StreamStatus.error;
           _streamError = msg;
@@ -561,34 +454,65 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
     }
   }
 
+  Future<void> _pauseStreaming() async {
+    if (_controller == null ||
+        !_isStreaming ||
+        _isStreamingPaused ||
+        _isDisposed)
+      return;
+    if (_controller!.value.isInitialized != true) return;
+    try {
+      await _controller!.pauseVideoStreaming();
+      if (mounted) setState(() => _isStreamingPaused = true);
+      debugPrint('Streaming paused');
+    } catch (e) {
+      debugPrint('Pause error: $e');
+    }
+  }
+
+  Future<void> _resumeStreaming() async {
+    if (_controller == null ||
+        !_isStreaming ||
+        !_isStreamingPaused ||
+        _isDisposed)
+      return;
+    if (_controller!.value.isInitialized != true) return;
+    try {
+      await _controller!.resumeVideoStreaming();
+      if (mounted) setState(() => _isStreamingPaused = false);
+      debugPrint('Streaming resumed');
+    } catch (e) {
+      debugPrint('Resume error: $e');
+    }
+  }
+
+  Future<void> _togglePauseResume() async {
+    if (_isStreamingPaused) {
+      await _resumeStreaming();
+    } else {
+      await _pauseStreaming();
+    }
+  }
+
   Future<void> _forceStopStreaming() async {
-    debugPrint('Force stopping stream...');
+    debugPrint('Force stopping stream');
     _connectionTimer?.cancel();
     _connectionTimer = null;
-
     try {
-      if (_controller != null) {
-        await _controller!.stopVideoStreaming().timeout(
-          const Duration(seconds: 5),
-          onTimeout: () {
-            debugPrint('Force stop: stopVideoStreaming timed out');
-          },
-        );
-      }
+      await _controller?.stopVideoStreaming().timeout(
+        const Duration(seconds: 5),
+      );
     } catch (e) {
       debugPrint('Force stop error (ignored): $e');
     }
-
-    setState(() {
-      _isStreaming = false;
-      _isStreamingPaused = false;
-      _streamStatus = _StreamStatus.idle;
-      _streamError = null;
-    });
-
-    WakelockPlus.disable();
-
     if (mounted) {
+      setState(() {
+        _isStreaming = false;
+        _isStreamingPaused = false;
+        _streamStatus = _StreamStatus.idle;
+        _streamError = null;
+      });
+      WakelockPlus.disable();
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
           content: Text('Stream force stopped'),
@@ -603,42 +527,30 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
     if (_cameras.length < 2 ||
         _controller == null ||
         _isStreaming ||
-        _isSwitchingCamera) {
-      debugPrint(
-        'Cannot switch camera: cameras=${_cameras.length}, controller=$_controller, streaming=$_isStreaming, switching=$_isSwitchingCamera',
-      );
+        _isSwitchingCamera)
       return;
-    }
+
+    setState(() {
+      _isSwitchingCamera = true;
+      _pageState = _PageState.initializingCamera;
+    });
 
     try {
-      setState(() => _isSwitchingCamera = true);
-
-      final currentCamera = _controller!.description;
+      final currentDir = _controller!.description.lensDirection;
       final nextCamera = _cameras.firstWhere(
-        (camera) => camera.lensDirection != currentCamera.lensDirection,
+        (c) => c.lensDirection != currentDir,
         orElse: () => _cameras.first,
       );
 
-      setState(() => _isInitializing = true);
-
-      // Remove listener before disposal
-      _controller?.removeListener(_onControllerUpdate);
-
-      // Properly dispose the old controller
-      final oldController = _controller;
+      _controller!.removeListener(_onControllerUpdate);
+      final old = _controller;
       _controller = null;
-      await oldController?.dispose();
+      await old?.dispose();
 
-      // Wait a bit to ensure proper cleanup
       await Future.delayed(const Duration(milliseconds: 100));
+      if (_isDisposed || !mounted) return;
 
-      if (!mounted || _isDisposing) {
-        debugPrint('Widget disposed during camera switch');
-        return;
-      }
-
-      // Create and initialize new controller
-      final newController = CameraController(
+      final nc = CameraController(
         nextCamera,
         ResolutionPreset.high,
         streamingPreset: ResolutionPreset.high,
@@ -646,68 +558,59 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
         androidUseOpenGL: true,
       );
 
-      await newController.initialize();
-
-      if (!mounted || _isDisposing) {
-        await newController.dispose();
+      await nc.initialize();
+      if (_isDisposed || !mounted) {
+        await nc.dispose();
         return;
       }
-
-      if (!newController.value.isInitialized!) {
-        throw Exception('New camera failed to initialize');
+      if (nc.value.isInitialized != true) {
+        await nc.dispose();
+        throw Exception('New camera failed to initialise');
       }
 
-      _controller = newController;
+      _controller = nc;
       _controller!.addListener(_onControllerUpdate);
-
       debugPrint('Camera switched successfully');
     } catch (e) {
-      debugPrint('Error switching camera: $e');
+      debugPrint('Camera switch error: $e');
       _showErrorBanner('Failed to switch camera: $e');
     } finally {
       if (mounted) {
         setState(() {
-          _isInitializing = false;
+          _pageState = _PageState.cameraReady;
           _isSwitchingCamera = false;
         });
       }
     }
   }
 
-  @override
-  void dispose() {
-    _isDisposing = true;
-    _isSwitchingCamera = false;
-    WidgetsBinding.instance.removeObserver(this);
-    _connectionTimer?.cancel();
-    _connectionTimer = null;
+  // ────────────────────────────────────────────────────────────────────────────
+  // Helpers
+  // ────────────────────────────────────────────────────────────────────────────
 
-    // Stop streaming if active
-    if (_isStreaming && _controller != null) {
-      try {
-        _controller?.stopVideoStreaming();
-      } catch (e) {
-        debugPrint('Error stopping stream during dispose: $e');
-      }
-    }
-
-    // Remove listener before disposal
-    _controller?.removeListener(_onControllerUpdate);
-
-    // Dispose controller
-    _controller?.dispose();
-    _controller = null;
-
-    WakelockPlus.disable();
-    super.dispose();
+  void _showErrorBanner(String message) {
+    if (!mounted || _isDisposed) return;
+    ScaffoldMessenger.of(context)
+      ..clearSnackBars()
+      ..showSnackBar(
+        SnackBar(
+          content: Text(message),
+          backgroundColor: Colors.red.shade700,
+          behavior: SnackBarBehavior.floating,
+          duration: const Duration(seconds: 5),
+        ),
+      );
   }
 
-  // ─── Helpers ────────────────────────────────────────────────────────────────
+  Future<void> _toggleMute() async {
+    final newState = !_isMuted;
+    await AudioManager.setMicrophoneMute(newState);
+    if (mounted) setState(() => _isMuted = newState);
+  }
 
   Color get _fabColor {
     switch (_streamStatus) {
       case _StreamStatus.connecting:
-        return Colors.orange;
       case _StreamStatus.retrying:
         return Colors.orange;
       case _StreamStatus.connected:
@@ -720,69 +623,19 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
     }
   }
 
-  Future<void> _toggleMute() async {
-    final newState = !_isMuted;
-    await AudioManager.setMicrophoneMute(newState);
-    setState(() {
-      _isMuted = newState;
-    });
-  }
+  // ────────────────────────────────────────────────────────────────────────────
+  // Status badge
+  // ────────────────────────────────────────────────────────────────────────────
 
   Widget _buildStatusBadge() {
-    const String proto = 'RTMP';
-
     switch (_streamStatus) {
       case _StreamStatus.connecting:
-        return _badge(
-          Colors.orange,
-          child: Row(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              const SizedBox(
-                width: 12,
-                height: 12,
-                child: CircularProgressIndicator(
-                  strokeWidth: 2,
-                  color: Colors.white,
-                ),
-              ),
-              const SizedBox(width: 8),
-              const Text(
-                'CONNECTING ($proto)',
-                style: TextStyle(
-                  color: Colors.white,
-                  fontWeight: FontWeight.bold,
-                  fontSize: 12,
-                ),
-              ),
-            ],
-          ),
-        );
-
+        return _badge(Colors.orange, child: _spinnerRow('CONNECTING (RTMP)'));
       case _StreamStatus.retrying:
         return _badge(
           Colors.deepOrange,
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              const Text(
-                'RETRYING ($proto)',
-                style: TextStyle(
-                  color: Colors.white,
-                  fontWeight: FontWeight.bold,
-                  fontSize: 12,
-                ),
-              ),
-              if (_streamError != null)
-                Text(
-                  _streamError!,
-                  style: const TextStyle(color: Colors.white70, fontSize: 10),
-                ),
-            ],
-          ),
+          child: _labelColumn('RETRYING (RTMP)', _streamError),
         );
-
       case _StreamStatus.connected:
         return _badge(
           _isStreamingPaused ? Colors.orange : Colors.red,
@@ -796,7 +649,7 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
               ),
               const SizedBox(width: 8),
               Text(
-                _isStreamingPaused ? 'PAUSED · $proto' : 'LIVE · $proto',
+                _isStreamingPaused ? 'PAUSED · RTMP' : 'LIVE · RTMP',
                 style: const TextStyle(
                   color: Colors.white,
                   fontWeight: FontWeight.bold,
@@ -805,70 +658,170 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
             ],
           ),
         );
-
       case _StreamStatus.error:
       case _StreamStatus.stopped:
         return _badge(
           Colors.black54,
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              const Text(
-                'DISCONNECTED ($proto)',
-                style: TextStyle(
-                  color: Colors.white,
-                  fontWeight: FontWeight.bold,
-                  fontSize: 12,
-                ),
-              ),
-              if (_streamError != null)
-                Text(
-                  _streamError!,
-                  style: const TextStyle(color: Colors.white70, fontSize: 10),
-                ),
-            ],
-          ),
+          child: _labelColumn('DISCONNECTED (RTMP)', _streamError),
         );
-
       default:
         return const SizedBox.shrink();
     }
   }
 
-  Widget _badge(Color color, {required Widget child}) {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-      decoration: BoxDecoration(
-        color: color,
-        borderRadius: BorderRadius.circular(16),
+  Widget _spinnerRow(String label) => Row(
+    mainAxisSize: MainAxisSize.min,
+    children: [
+      const SizedBox(
+        width: 12,
+        height: 12,
+        child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
       ),
-      child: child,
-    );
-  }
+      const SizedBox(width: 8),
+      Text(
+        label,
+        style: const TextStyle(
+          color: Colors.white,
+          fontWeight: FontWeight.bold,
+          fontSize: 12,
+        ),
+      ),
+    ],
+  );
 
-  // ─── Build ───────────────────────────────────────────────────────────────────
+  Widget _labelColumn(String title, String? subtitle) => Column(
+    mainAxisSize: MainAxisSize.min,
+    crossAxisAlignment: CrossAxisAlignment.start,
+    children: [
+      Text(
+        title,
+        style: const TextStyle(
+          color: Colors.white,
+          fontWeight: FontWeight.bold,
+          fontSize: 12,
+        ),
+      ),
+      if (subtitle != null)
+        Text(
+          subtitle,
+          style: const TextStyle(color: Colors.white70, fontSize: 10),
+        ),
+    ],
+  );
+
+  Widget _badge(Color color, {required Widget child}) => Container(
+    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+    decoration: BoxDecoration(
+      color: color,
+      borderRadius: BorderRadius.circular(16),
+    ),
+    child: child,
+  );
+
+  // ────────────────────────────────────────────────────────────────────────────
+  // Scaffold helpers for pre-camera states
+  // ────────────────────────────────────────────────────────────────────────────
+
+  Widget _loadingScaffold(String message) => Scaffold(
+    appBar: AppBar(title: const Text('Live Stream · RTMP')),
+    body: Center(
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          const CircularProgressIndicator(),
+          const SizedBox(height: 16),
+          Text(message, style: const TextStyle(fontSize: 16)),
+        ],
+      ),
+    ),
+  );
+
+  Widget _errorScaffold(
+    String message, {
+    required VoidCallback onRetry,
+    String retryLabel = 'Retry',
+  }) => Scaffold(
+    appBar: AppBar(title: const Text('Live Stream · RTMP')),
+    body: Center(
+      child: Padding(
+        padding: const EdgeInsets.all(32),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Icon(Icons.error_outline, size: 64, color: Colors.red),
+            const SizedBox(height: 16),
+            Text(
+              message,
+              textAlign: TextAlign.center,
+              style: const TextStyle(fontSize: 16),
+            ),
+            const SizedBox(height: 24),
+            ElevatedButton.icon(
+              onPressed: onRetry,
+              icon: const Icon(Icons.refresh),
+              label: Text(retryLabel),
+            ),
+          ],
+        ),
+      ),
+    ),
+  );
+
+  // ────────────────────────────────────────────────────────────────────────────
+  // Build
+  // ────────────────────────────────────────────────────────────────────────────
 
   @override
   Widget build(BuildContext context) {
-    if (_isInitializing) {
-      return const Scaffold(body: Center(child: CircularProgressIndicator()));
+    // Render the appropriate screen for each pre-camera state.
+    switch (_pageState) {
+      case _PageState.checkingConnection:
+        return _loadingScaffold('Checking connection to server…');
+
+      case _PageState.connectionFailed:
+        return _errorScaffold(
+          _pageError ?? 'Could not reach the RTMP server.',
+          onRetry: _checkConnection,
+        );
+
+      case _PageState.requestingPermissions:
+        return _loadingScaffold('Requesting permissions…');
+
+      case _PageState.permissionDenied:
+        final isPermanent = _pageError?.contains('permanently') ?? false;
+        return _errorScaffold(
+          _pageError ?? 'Permissions denied.',
+          onRetry: isPermanent
+              ? () async => openAppSettings()
+              : _requestPermissions,
+          retryLabel: isPermanent ? 'Open Settings' : 'Grant Permissions',
+        );
+
+      case _PageState.initializingCamera:
+        return _loadingScaffold('Initialising camera…');
+
+      case _PageState.cameraError:
+        return _errorScaffold(
+          _pageError ?? 'Camera error.',
+          onRetry: _initCamera,
+        );
+
+      case _PageState.cameraReady:
+        break; // Fall through to camera UI.
     }
 
-    if (_controller == null || !_controller!.value.isInitialized!) {
-      return const Scaffold(
-        body: Center(child: Text("Failed to initialize camera.")),
-      );
+    // Safety net – should not normally occur.
+    if (_controller == null || _controller!.value.isInitialized != true) {
+      return _loadingScaffold('Starting camera…');
     }
 
     final bool isBusy =
         _streamStatus == _StreamStatus.connecting ||
         _streamStatus == _StreamStatus.retrying;
-    const String proto = 'RTMP';
 
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Live Stream · $proto'),
+        title: const Text('Live Stream · RTMP'),
         actions: [
           if (_isStreaming)
             IconButton(
@@ -880,7 +833,7 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
           if (!_isStreaming)
             IconButton(
               icon: const Icon(Icons.cameraswitch),
-              onPressed: _switchCamera,
+              onPressed: _isSwitchingCamera ? null : _switchCamera,
             ),
         ],
       ),
@@ -888,27 +841,25 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
         children: [
           Positioned.fill(child: CameraPreview(_controller!)),
 
-          // Status badge (top-right)
+          // Streaming status badge (top-right)
           Positioned(top: 20, right: 20, child: _buildStatusBadge()),
 
-          // Volume indicator (top-left)
-          if ((_streamStatus == _StreamStatus.connected ||
-                  _isTestingConnection) &&
-              !_isStreamingPaused)
+          // Volume indicator while live (top-left)
+          if (_streamStatus == _StreamStatus.connected && !_isStreamingPaused)
             Positioned(
               top: 20,
               left: 20,
               child: GestureDetector(
                 onTap: _toggleMute,
                 child: VolumeIndicator(
-                  isStreaming: _isStreaming || _isTestingConnection,
+                  isStreaming: _isStreaming,
                   isMuted: _isMuted,
                 ),
               ),
             ),
 
-          // Mute toggle (top-left, beneath volume if visible, or where volume was)
-          if (!_isTestingConnection && !_isStreaming)
+          // Mute toggle when idle (top-left)
+          if (!_isStreaming)
             Positioned(
               top: 20,
               left: 20,
@@ -925,67 +876,7 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
               ),
             ),
 
-          // Connection test result (top-center)
-          if (_connectionTestResult != null)
-            Positioned(
-              top: 70,
-              left: 20,
-              right: 20,
-              child: Container(
-                padding: const EdgeInsets.all(16),
-                decoration: BoxDecoration(
-                  color: _streamStatus == _StreamStatus.error
-                      ? Colors.red.withOpacity(0.9)
-                      : _isTestingConnection
-                      ? Colors.orange.withOpacity(0.9)
-                      : Colors.green.withOpacity(0.9),
-                  borderRadius: BorderRadius.circular(12),
-                ),
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    if (_isTestingConnection)
-                      const SizedBox(
-                        width: 24,
-                        height: 24,
-                        child: CircularProgressIndicator(
-                          strokeWidth: 2,
-                          color: Colors.white,
-                        ),
-                      ),
-                    const SizedBox(height: 8),
-                    Text(
-                      _connectionTestResult!,
-                      style: const TextStyle(
-                        color: Colors.white,
-                        fontWeight: FontWeight.bold,
-                        fontSize: 14,
-                      ),
-                      textAlign: TextAlign.center,
-                    ),
-                    if (!_isTestingConnection &&
-                        _streamStatus != _StreamStatus.error)
-                      Padding(
-                        padding: const EdgeInsets.only(top: 8),
-                        child: ElevatedButton(
-                          onPressed: () {
-                            setState(() {
-                              _connectionTestResult = null;
-                            });
-                          },
-                          style: ElevatedButton.styleFrom(
-                            backgroundColor: Colors.white,
-                            foregroundColor: Colors.green,
-                          ),
-                          child: const Text('Dismiss'),
-                        ),
-                      ),
-                  ],
-                ),
-              ),
-            ),
-
-          // Stream control button (bottom-center)
+          // Stream controls (bottom-centre)
           Positioned(
             bottom: 40,
             left: 0,
@@ -993,7 +884,6 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
             child: Row(
               mainAxisAlignment: MainAxisAlignment.center,
               children: [
-                // Pause/Resume button (only when streaming)
                 if (_isStreaming) ...[
                   FloatingActionButton(
                     heroTag: 'pause',
@@ -1006,7 +896,6 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
                   ),
                   const SizedBox(width: 16),
                 ],
-                // Start/Stop button
                 FloatingActionButton(
                   heroTag: 'stream',
                   backgroundColor: _fabColor,

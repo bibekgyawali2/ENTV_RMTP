@@ -1,189 +1,282 @@
 import 'package:flutter/material.dart';
 
-/// Application theme configuration
+/// Minimalistic light theme configuration
 class AppTheme {
-  // Light color palette
-  static const Color _darkText = Color(0xFF1A1A1A);
-  static const Color _mediumText = Color(0xFF6B6B6B);
-  static const Color _lightText = Color(0xFFB0B0B0);
-  static const Color _background = Color(0xFFFBFBFB);
-  static const Color _surface = Color(0xFFFFFFFF);
-  static const Color _border = Color(0xFFEEEEEE);
-  static const Color _error = Color(0xFFE53935);
+  // Ultra-light color palette (minimalistic)
+  static const Color _primary = Color(0xFF1F1F1F); // Charcoal (very dark)
+  static const Color _secondary = Color(0xFF757575); // Medium gray
+  static const Color _tertiary = Color(0xFFC0C0C0); // Light gray
+  static const Color _background = Color(0xFFFAFAFA); // Almost white
+  static const Color _surface = Color(0xFFFFFFFF); // Pure white
+  static const Color _border = Color(0xFFE8E8E8); // Ultra-light border
+  static const Color _error = Color(0xFFD32F2F); // Soft red
+  static const Color _divider = Color(0xFFF0F0F0); // Divider gray
 
-  /// Light theme configuration
+  /// Minimalistic light theme
   static ThemeData get lightTheme {
     return ThemeData(
       useMaterial3: true,
       brightness: Brightness.light,
 
-      // Color scheme with very light colors
+      // Minimalistic color scheme
       colorScheme: const ColorScheme.light(
-        primary: _darkText,
-        secondary: _mediumText,
+        primary: _primary,
+        secondary: _secondary,
+        tertiary: _tertiary,
         surface: _surface,
         surfaceBright: _background,
         error: _error,
         outline: _border,
+        outlineVariant: _divider,
       ),
 
       scaffoldBackgroundColor: _background,
 
-      // AppBar styling
+      // Minimal AppBar
       appBarTheme: const AppBarTheme(
-        backgroundColor: _background,
+        backgroundColor: _surface,
         surfaceTintColor: Colors.transparent,
         elevation: 0,
+        shadowColor: Colors.transparent,
         centerTitle: true,
         titleTextStyle: TextStyle(
-          color: _darkText,
-          fontSize: 18,
-          fontWeight: FontWeight.w500,
-          letterSpacing: -0.3,
+          color: _primary,
+          fontSize: 16,
+          fontWeight: FontWeight.w400,
+          letterSpacing: 0.5,
         ),
-        iconTheme: IconThemeData(color: _darkText, size: 24),
+        iconTheme: IconThemeData(color: _primary, size: 22),
       ),
 
-      // Button styling
+      // Minimal button styling
       elevatedButtonTheme: ElevatedButtonThemeData(
         style: ElevatedButton.styleFrom(
-          backgroundColor: _darkText,
+          backgroundColor: _primary,
           foregroundColor: Colors.white,
           elevation: 0,
           shadowColor: Colors.transparent,
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(12),
-          ),
-          padding: const EdgeInsets.symmetric(horizontal: 28, vertical: 16),
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+          padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 14),
           textStyle: const TextStyle(
-            fontSize: 15,
-            fontWeight: FontWeight.w500,
-            letterSpacing: -0.2,
+            fontSize: 14,
+            fontWeight: FontWeight.w400,
+            letterSpacing: 0.3,
           ),
         ),
       ),
 
-      // Input field styling
+      // Minimal outlined button
+      outlinedButtonTheme: OutlinedButtonThemeData(
+        style: OutlinedButton.styleFrom(
+          foregroundColor: _primary,
+          side: const BorderSide(color: _border, width: 1),
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+          padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 14),
+          textStyle: const TextStyle(
+            fontSize: 14,
+            fontWeight: FontWeight.w400,
+            letterSpacing: 0.3,
+          ),
+        ),
+      ),
+
+      // Minimal filled button
+      filledButtonTheme: FilledButtonThemeData(
+        style: FilledButton.styleFrom(
+          backgroundColor: _primary,
+          foregroundColor: Colors.white,
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+          padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 14),
+          textStyle: const TextStyle(
+            fontSize: 14,
+            fontWeight: FontWeight.w400,
+            letterSpacing: 0.3,
+          ),
+        ),
+      ),
+
+      // Minimal input fields
       inputDecorationTheme: InputDecorationTheme(
         filled: true,
         fillColor: _surface,
         contentPadding: const EdgeInsets.symmetric(
-          horizontal: 20,
-          vertical: 16,
+          horizontal: 16,
+          vertical: 14,
         ),
         border: OutlineInputBorder(
-          borderRadius: BorderRadius.circular(12),
+          borderRadius: BorderRadius.circular(8),
           borderSide: const BorderSide(color: _border, width: 1),
         ),
         enabledBorder: OutlineInputBorder(
-          borderRadius: BorderRadius.circular(12),
+          borderRadius: BorderRadius.circular(8),
           borderSide: const BorderSide(color: _border, width: 1),
         ),
         focusedBorder: OutlineInputBorder(
-          borderRadius: BorderRadius.circular(12),
-          borderSide: const BorderSide(color: _darkText, width: 1.5),
+          borderRadius: BorderRadius.circular(8),
+          borderSide: const BorderSide(color: _primary, width: 1.5),
         ),
         errorBorder: OutlineInputBorder(
-          borderRadius: BorderRadius.circular(12),
+          borderRadius: BorderRadius.circular(8),
           borderSide: const BorderSide(color: _error, width: 1),
         ),
+        focusedErrorBorder: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(8),
+          borderSide: const BorderSide(color: _error, width: 1.5),
+        ),
         labelStyle: const TextStyle(
-          color: _mediumText,
-          fontSize: 14,
+          color: _secondary,
+          fontSize: 13,
           fontWeight: FontWeight.w400,
         ),
         floatingLabelStyle: const TextStyle(
-          color: _darkText,
-          fontSize: 14,
-          fontWeight: FontWeight.w500,
+          color: _primary,
+          fontSize: 13,
+          fontWeight: FontWeight.w400,
         ),
-        prefixIconColor: _mediumText,
-        hintStyle: const TextStyle(color: _lightText, fontSize: 14),
+        prefixIconColor: _secondary,
+        suffixIconColor: _secondary,
+        hintStyle: const TextStyle(color: _tertiary, fontSize: 13),
+        helperStyle: const TextStyle(color: _tertiary, fontSize: 12),
       ),
 
-      // Text styling
+      // Minimal text theme
       textTheme: const TextTheme(
         displayLarge: TextStyle(
           fontSize: 32,
-          fontWeight: FontWeight.w600,
-          color: _darkText,
-          letterSpacing: -0.5,
+          fontWeight: FontWeight.w300,
+          color: _primary,
+          letterSpacing: 0,
         ),
         displayMedium: TextStyle(
           fontSize: 28,
-          fontWeight: FontWeight.w600,
-          color: _darkText,
-          letterSpacing: -0.5,
+          fontWeight: FontWeight.w300,
+          color: _primary,
+          letterSpacing: 0,
+        ),
+        displaySmall: TextStyle(
+          fontSize: 24,
+          fontWeight: FontWeight.w400,
+          color: _primary,
+          letterSpacing: 0,
         ),
         headlineMedium: TextStyle(
-          fontSize: 24,
-          fontWeight: FontWeight.w500,
-          color: _darkText,
-          letterSpacing: -0.3,
+          fontSize: 20,
+          fontWeight: FontWeight.w400,
+          color: _primary,
+          letterSpacing: 0,
+        ),
+        headlineSmall: TextStyle(
+          fontSize: 18,
+          fontWeight: FontWeight.w400,
+          color: _primary,
+          letterSpacing: 0,
         ),
         titleLarge: TextStyle(
-          fontSize: 18,
+          fontSize: 16,
+          fontWeight: FontWeight.w400,
+          color: _primary,
+          letterSpacing: 0,
+        ),
+        titleMedium: TextStyle(
+          fontSize: 14,
           fontWeight: FontWeight.w500,
-          color: _darkText,
-          letterSpacing: -0.2,
+          color: _primary,
+          letterSpacing: 0.1,
+        ),
+        titleSmall: TextStyle(
+          fontSize: 12,
+          fontWeight: FontWeight.w500,
+          color: _primary,
+          letterSpacing: 0.1,
         ),
         bodyLarge: TextStyle(
           fontSize: 16,
           fontWeight: FontWeight.w400,
-          color: _darkText,
-          letterSpacing: -0.1,
+          color: _primary,
+          letterSpacing: 0,
         ),
         bodyMedium: TextStyle(
           fontSize: 14,
           fontWeight: FontWeight.w400,
-          color: _mediumText,
-          letterSpacing: -0.1,
+          color: _secondary,
+          letterSpacing: 0,
         ),
         bodySmall: TextStyle(
           fontSize: 12,
           fontWeight: FontWeight.w400,
-          color: _lightText,
-          letterSpacing: -0.1,
+          color: _tertiary,
+          letterSpacing: 0,
+        ),
+        labelLarge: TextStyle(
+          fontSize: 12,
+          fontWeight: FontWeight.w500,
+          color: _primary,
+          letterSpacing: 0.5,
         ),
       ),
 
-      // Icon styling
-      iconTheme: const IconThemeData(color: _darkText, size: 24),
+      // Minimal icon theme
+      iconTheme: const IconThemeData(color: _primary, size: 22),
 
-      // Card styling
+      // Minimal card styling
       cardTheme: CardThemeData(
         color: _surface,
         elevation: 0,
+        shadowColor: Colors.transparent,
         shape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.circular(12),
+          borderRadius: BorderRadius.circular(8),
           side: const BorderSide(color: _border, width: 1),
         ),
       ),
 
-      // Divider styling
+      // Minimal divider
       dividerTheme: const DividerThemeData(
-        color: _border,
+        color: _divider,
         thickness: 1,
         space: 1,
+        indent: 0,
+        endIndent: 0,
       ),
 
-      // FloatingActionButton styling
-      floatingActionButtonTheme: FloatingActionButtonThemeData(
-        backgroundColor: _darkText,
-        foregroundColor: Colors.white,
-        elevation: 4,
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-      ),
-
-      // SnackBar styling
-      snackBarTheme: SnackBarThemeData(
-        backgroundColor: _darkText.withOpacity(0.9),
-        contentTextStyle: const TextStyle(
-          color: Colors.white,
-          fontSize: 14,
+      // Minimal chip theme
+      chipTheme: ChipThemeData(
+        backgroundColor: _surface,
+        selectedColor: _primary,
+        labelStyle: const TextStyle(
+          color: _primary,
+          fontSize: 13,
           fontWeight: FontWeight.w400,
         ),
+        secondaryLabelStyle: const TextStyle(
+          color: Colors.white,
+          fontSize: 13,
+          fontWeight: FontWeight.w400,
+        ),
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(6),
+          side: const BorderSide(color: _border),
+        ),
+        side: const BorderSide(color: _border, width: 1),
+      ),
+
+      // Minimal FAB
+      floatingActionButtonTheme: FloatingActionButtonThemeData(
+        backgroundColor: _primary,
+        foregroundColor: Colors.white,
+        elevation: 2,
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+      ),
+
+      // Minimal SnackBar
+      snackBarTheme: SnackBarThemeData(
+        backgroundColor: _primary,
+        contentTextStyle: const TextStyle(
+          color: Colors.white,
+          fontSize: 13,
+          fontWeight: FontWeight.w400,
+        ),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(6)),
+        elevation: 0,
       ),
     );
   }
