@@ -39,6 +39,7 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
   bool _isStreamingPaused = false;
   bool _isMuted = false;
   bool _isDisposing = false;
+  bool _isSwitchingCamera = false;
 
   _StreamStatus _streamStatus = _StreamStatus.idle;
   String? _streamError;
@@ -243,7 +244,14 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
 
   /// Listens to every CameraValue change and reacts to streaming lifecycle events.
   void _onControllerUpdate() {
-    if (_controller == null || !mounted) return;
+    if (_controller == null || !mounted || _isDisposing || _isSwitchingCamera)
+      return;
+
+    // Check if controller is still valid
+    if (!_controller!.value.isInitialized!) {
+      debugPrint('Controller not initialized in update');
+      return;
+    }
 
     // Check actual streaming state from controller
     final bool isActuallyStreaming =
@@ -385,7 +393,8 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
   }
 
   Future<void> _testConnection() async {
-    if (_controller == null || _isTestingConnection) return;
+    if (_controller == null || _isTestingConnection || _isDisposing) return;
+    if (!_controller!.value.isInitialized!) return;
 
     setState(() {
       _isTestingConnection = true;
@@ -455,13 +464,20 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
   }
 
   Future<void> _pauseStreaming() async {
-    if (_controller == null || !_isStreaming || _isStreamingPaused) return;
+    if (_controller == null ||
+        !_isStreaming ||
+        _isStreamingPaused ||
+        _isDisposing)
+      return;
 
     try {
+      if (!_controller!.value.isInitialized!) return;
       await _controller!.pauseVideoStreaming();
-      setState(() {
-        _isStreamingPaused = true;
-      });
+      if (mounted) {
+        setState(() {
+          _isStreamingPaused = true;
+        });
+      }
       debugPrint('Streaming paused');
     } catch (e) {
       debugPrint('Pause streaming error: $e');
@@ -470,13 +486,20 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
   }
 
   Future<void> _resumeStreaming() async {
-    if (_controller == null || !_isStreaming || !_isStreamingPaused) return;
+    if (_controller == null ||
+        !_isStreaming ||
+        !_isStreamingPaused ||
+        _isDisposing)
+      return;
 
     try {
+      if (!_controller!.value.isInitialized!) return;
       await _controller!.resumeVideoStreaming();
-      setState(() {
-        _isStreamingPaused = false;
-      });
+      if (mounted) {
+        setState(() {
+          _isStreamingPaused = false;
+        });
+      }
       debugPrint('Streaming resumed');
     } catch (e) {
       debugPrint('Resume streaming error: $e');
@@ -576,40 +599,105 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
     }
   }
 
-  void _switchCamera() async {
-    if (_cameras.length < 2 || _controller == null || _isStreaming) return;
+  Future<void> _switchCamera() async {
+    if (_cameras.length < 2 ||
+        _controller == null ||
+        _isStreaming ||
+        _isSwitchingCamera) {
+      debugPrint(
+        'Cannot switch camera: cameras=${_cameras.length}, controller=$_controller, streaming=$_isStreaming, switching=$_isSwitchingCamera',
+      );
+      return;
+    }
 
-    final currentCamera = _controller!.description;
-    final nextCamera = _cameras.firstWhere(
-      (camera) => camera.lensDirection != currentCamera.lensDirection,
-      orElse: () => _cameras.first,
-    );
+    try {
+      setState(() => _isSwitchingCamera = true);
 
-    setState(() => _isInitializing = true);
-    _controller!.removeListener(_onControllerUpdate);
-    await _controller!.dispose();
-    _controller = CameraController(
-      nextCamera,
-      ResolutionPreset.high,
-      streamingPreset: ResolutionPreset.high,
-      enableAudio: true,
-      androidUseOpenGL: true,
-    );
-    await _controller!.initialize();
-    _controller!.addListener(_onControllerUpdate);
-    setState(() => _isInitializing = false);
+      final currentCamera = _controller!.description;
+      final nextCamera = _cameras.firstWhere(
+        (camera) => camera.lensDirection != currentCamera.lensDirection,
+        orElse: () => _cameras.first,
+      );
+
+      setState(() => _isInitializing = true);
+
+      // Remove listener before disposal
+      _controller?.removeListener(_onControllerUpdate);
+
+      // Properly dispose the old controller
+      final oldController = _controller;
+      _controller = null;
+      await oldController?.dispose();
+
+      // Wait a bit to ensure proper cleanup
+      await Future.delayed(const Duration(milliseconds: 100));
+
+      if (!mounted || _isDisposing) {
+        debugPrint('Widget disposed during camera switch');
+        return;
+      }
+
+      // Create and initialize new controller
+      final newController = CameraController(
+        nextCamera,
+        ResolutionPreset.high,
+        streamingPreset: ResolutionPreset.high,
+        enableAudio: true,
+        androidUseOpenGL: true,
+      );
+
+      await newController.initialize();
+
+      if (!mounted || _isDisposing) {
+        await newController.dispose();
+        return;
+      }
+
+      if (!newController.value.isInitialized!) {
+        throw Exception('New camera failed to initialize');
+      }
+
+      _controller = newController;
+      _controller!.addListener(_onControllerUpdate);
+
+      debugPrint('Camera switched successfully');
+    } catch (e) {
+      debugPrint('Error switching camera: $e');
+      _showErrorBanner('Failed to switch camera: $e');
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isInitializing = false;
+          _isSwitchingCamera = false;
+        });
+      }
+    }
   }
 
   @override
   void dispose() {
     _isDisposing = true;
+    _isSwitchingCamera = false;
     WidgetsBinding.instance.removeObserver(this);
     _connectionTimer?.cancel();
-    _controller?.removeListener(_onControllerUpdate);
-    if (_isStreaming) {
-      _controller?.stopVideoStreaming();
+    _connectionTimer = null;
+
+    // Stop streaming if active
+    if (_isStreaming && _controller != null) {
+      try {
+        _controller?.stopVideoStreaming();
+      } catch (e) {
+        debugPrint('Error stopping stream during dispose: $e');
+      }
     }
+
+    // Remove listener before disposal
+    _controller?.removeListener(_onControllerUpdate);
+
+    // Dispose controller
     _controller?.dispose();
+    _controller = null;
+
     WakelockPlus.disable();
     super.dispose();
   }
