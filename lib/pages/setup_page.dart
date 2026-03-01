@@ -98,7 +98,11 @@ class _SetupPageState extends State<SetupPage> {
 
     Navigator.of(context).push(
       MaterialPageRoute(
-        builder: (_) => CameraPage(streamUrl: streamUrl, autoStart: false),
+        builder: (_) => CameraPage(
+          streamUrl: streamUrl,
+          autoStart: false,
+          testConnection: true,
+        ),
       ),
     );
   }
@@ -108,57 +112,75 @@ class _SetupPageState extends State<SetupPage> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('Stream Setup')),
-      body: SingleChildScrollView(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            const SizedBox(height: 16),
-            const Text(
-              'Stream Configuration',
-              style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold),
-              textAlign: TextAlign.center,
-            ),
-            const SizedBox(height: 24),
-            _RtmpFields(
-              urlController: _rtmpUrlController,
-              keyController: _rtmpKeyController,
-            ),
-            const SizedBox(height: 32),
-            ElevatedButton(
-              onPressed: _isLoading ? null : _goToCameraOnly,
-              style: ElevatedButton.styleFrom(
-                padding: const EdgeInsets.symmetric(vertical: 16),
-                backgroundColor: Colors.blue.shade700,
+      appBar: AppBar(title: const Text('STREAM SETUP')),
+      body: Center(
+        child: SingleChildScrollView(
+          padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 32),
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              const Icon(Icons.live_tv_rounded, size: 80),
+              const SizedBox(height: 16),
+              const Text(
+                'Ready to go live?',
+                style: TextStyle(
+                  fontSize: 28,
+                  fontWeight: FontWeight.bold,
+                  letterSpacing: -0.5,
+                ),
+                textAlign: TextAlign.center,
               ),
-              child: _isLoading
-                  ? const SizedBox(
-                      height: 20,
-                      width: 20,
-                      child: CircularProgressIndicator(strokeWidth: 2),
-                    )
-                  : const Text('Connect Only', style: TextStyle(fontSize: 18)),
-            ),
-            const SizedBox(height: 16),
-            ElevatedButton(
-              onPressed: _isLoading ? null : _goToCamera,
-              style: ElevatedButton.styleFrom(
-                padding: const EdgeInsets.symmetric(vertical: 16),
+              const SizedBox(height: 8),
+              const Text(
+                'Configure your RTMP endpoint details below.',
+                style: TextStyle(fontSize: 14, color: Colors.white54),
+                textAlign: TextAlign.center,
               ),
-              child: _isLoading
-                  ? const SizedBox(
-                      height: 20,
-                      width: 20,
-                      child: CircularProgressIndicator(strokeWidth: 2),
-                    )
-                  : const Text(
-                      'Connect & Start Streaming',
-                      style: TextStyle(fontSize: 18),
-                    ),
-            ),
-            const SizedBox(height: 24),
-          ],
+              const SizedBox(height: 48),
+              _RtmpFields(
+                urlController: _rtmpUrlController,
+                keyController: _rtmpKeyController,
+              ),
+              const SizedBox(height: 40),
+              ElevatedButton.icon(
+                onPressed: _isLoading ? null : _goToCameraOnly,
+                icon: _isLoading
+                    ? const SizedBox(
+                        width: 20,
+                        height: 20,
+                        child: CircularProgressIndicator(
+                          strokeWidth: 2,
+                          color: Colors.black,
+                        ),
+                      )
+                    : const Icon(Icons.preview_rounded),
+                label: const Text('LAUNCH CAMERA PREVIEW'),
+                style: ElevatedButton.styleFrom(elevation: 0),
+              ),
+              const SizedBox(height: 16),
+              ElevatedButton.icon(
+                onPressed: _isLoading ? null : _goToCamera,
+                icon: _isLoading
+                    ? const SizedBox(
+                        width: 20,
+                        height: 20,
+                        child: CircularProgressIndicator(
+                          strokeWidth: 2,
+                          color: Colors.black,
+                        ),
+                      )
+                    : const Icon(Icons.stream),
+                label: const Text('CONNECT & STREAM'),
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: Colors.white,
+                  foregroundColor: Colors.black,
+                  elevation: 4,
+                ),
+              ),
+              const SizedBox(height: 24),
+            ],
+          ),
         ),
       ),
     );
@@ -175,9 +197,6 @@ class _RtmpFields extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final fullUrl =
-        '${urlController.text.trimRight().replaceAll(RegExp(r'/+$'), '')}'
-        '/${keyController.text.trim()}';
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
@@ -187,7 +206,6 @@ class _RtmpFields extends StatelessWidget {
           decoration: const InputDecoration(
             labelText: 'RTMP URL',
             hintText: 'rtmp://[ip]:[port]/[app]',
-            border: OutlineInputBorder(),
             prefixIcon: Icon(Icons.link),
           ),
         ),
@@ -195,20 +213,10 @@ class _RtmpFields extends StatelessWidget {
         TextField(
           controller: keyController,
           decoration: const InputDecoration(
-            labelText: 'Stream Name / Key',
+            labelText: 'Stream Key',
             hintText: 'e.g. mystream',
-            border: OutlineInputBorder(),
             prefixIcon: Icon(Icons.key),
           ),
-        ),
-        const SizedBox(height: 8),
-        Text(
-          'Full URL: $fullUrl',
-          style: Theme.of(
-            context,
-          ).textTheme.bodySmall?.copyWith(color: Colors.grey),
-          maxLines: 2,
-          overflow: TextOverflow.ellipsis,
         ),
       ],
     );
